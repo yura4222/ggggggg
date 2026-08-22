@@ -1,0 +1,25 @@
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [work]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: python -m unittest discover -s tests -v
+      - shell: cmd
+        run: build.bat
+      - shell: powershell
+        run: Compress-Archive -Path dist\* -DestinationPath MAX-Chat-Link-Finder-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MAX-Chat-Link-Finder-Windows
+          path: MAX-Chat-Link-Finder-Windows.zip
