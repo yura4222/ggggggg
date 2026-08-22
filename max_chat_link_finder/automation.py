@@ -28,6 +28,33 @@ DIALOG_ROW_SELECTOR = ", ".join((
     '[class*="DialogItem"]', '[class*="dialogItem"]',
 ))
 
+MARK_VISIBLE_ROWS_SCRIPT = r"""
+() => {
+  document.querySelectorAll('[data-max-finder-row]').forEach(e => e.removeAttribute('data-max-finder-row'));
+  const search = [...document.querySelectorAll('input')].find(e =>
+    /^(найти|search)/i.test(e.placeholder || '') && e.getBoundingClientRect().width > 200);
+  if (!search) return {count: 0, reason: 'search input not found'};
+  const anchor = search.getBoundingClientRect();
+  const candidates = [...document.querySelectorAll('body *')].filter(element => {
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    const text = (element.innerText || '').trim();
+    return text && style.display !== 'none' && style.visibility !== 'hidden'
+      && rect.top >= anchor.bottom - 2 && rect.bottom <= innerHeight + 2
+      && rect.left <= anchor.left + 24 && rect.right >= anchor.right - 24
+      && rect.height >= 58 && rect.height <= 135
+      && (!!element.querySelector('img, [role="img"], svg') || text.split('\n').filter(Boolean).length >= 2);
+  });
+  // Keep the widest outer row when several nested elements describe one item.
+  const rows = candidates.filter(element => !candidates.some(other =>
+    other !== element && other.contains(element)
+    && Math.abs(other.getBoundingClientRect().top - element.getBoundingClientRect().top) < 4
+    && Math.abs(other.getBoundingClientRect().bottom - element.getBoundingClientRect().bottom) < 4));
+  rows.forEach((row, index) => row.setAttribute('data-max-finder-row', String(index)));
+  return {count: rows.length, reason: 'geometry below search input'};
+}
+"""
+
 MODEL_EVIDENCE_SCRIPT = r"""
 (element) => {
   const evidence = {};
@@ -81,21 +108,22 @@ class DelayRange:
         stop.wait(random.uniform(self.minimum, self.maximum))
 
 
-def classify_dialog(evidence: dict[str, list[str]]) -> tuple[bool, str]:
-    """Accept only an explicit group/chat model and reject unsafe entity types."""
+def classify_dialog(evidence: dict[str, list[str]], name: str = "") -> tuple[bool, str]:
+    """Accept chat rows, excluding channels and the official MAX conversation."""
+    if "max" in name.casefold():
+        return False, "название содержит MAX"
     pairs = [(key.casefold(), value.casefold()) for key, values in evidence.items() for value in values]
-    negative_words = ("channel", "direct", "private", "dialog", "user", "bot", "system", "official")
     for key, value in pairs:
-        if any(word in value for word in negative_words) and ("type" in key or key.endswith(("ischannel", "isdirect", "isprivate", "issystem"))):
-            return False, f"исключающий признак {key}={value}"
-        if key.endswith(("ischannel", "isdirect", "isprivate", "issystem")) and value == "true":
-            return False, f"исключающий признак {key}=true"
+        if "channel" in value and "type" in key:
+            return False, f"признак канала {key}={value}"
+        if key.endswith("ischannel") and value == "true":
+            return False, f"признак канала {key}=true"
     for key, value in pairs:
         if key.endswith("isgroup") and value == "true":
-            return True, f"{key}=true"
-        if "type" in key and value.replace("_", "-") in {"group", "group-chat", "groupchat", "supergroup", "chat"}:
-            return True, f"{key}={value}"
-    return False, "нет явного признака группы в DOM/React-модели"
+            return True, f"группа: {key}=true"
+        if "type" in key and value.replace("_", "-") in {"direct", "private", "dialog", "user"}:
+            return True, f"личный чат: {key}={value}"
+    return True, "обычная строка раздела «Чаты»"
 
 
 class MaxAutomation:
@@ -120,63 +148,89 @@ class MaxAutomation:
         self.page.goto(MAX_URL, wait_until="domcontentloaded")
         self.log("Открыт официальный web.max.ru. Выполните вход самостоятельно.")
 
-    def _confirmed_group_rows(self):
-        rows = self.page.locator(DIALOG_ROW_SELECTOR).filter(visible=True)
+    def _scannable_chat_rows(self, processed: set[str] | None = None):
+        processed = processed or set()
+        discovery = self.page.evaluate(MARK_VISIBLE_ROWS_SCRIPT)
+        geometric = self.page.locator('[data-max-finder-row]').filter(visible=True)
+        semantic = self.page.locator(DIALOG_ROW_SELECTOR).filter(visible=True)
+        rows = geometric.or_(semantic)
         groups, rejected, seen = [], 0, set()
         for index in range(rows.count()):
             row = rows.nth(index)
             try:
                 details = row.evaluate(MODEL_EVIDENCE_SCRIPT)
                 key = details["id"] or details["href"] or details["text"]
-                if not key or key in seen: continue
+                if not key or key in seen or key in processed: continue
                 seen.add(key)
-                accepted, reason = classify_dialog(details["evidence"])
                 name = details["text"].splitlines()[0] if details["text"] else key
+                accepted, reason = classify_dialog(details["evidence"], name)
                 if accepted:
-                    groups.append((row, name, reason)); self.log(f"Группа подтверждена: {name} ({reason})")
+                    groups.append((row, name, reason, key)); self.log(f"Чат добавлен: {name} ({reason})")
                 else:
                     rejected += 1
             except Exception as error:
                 self.log(f"Не удалось классифицировать строку {index + 1}: {error}")
-        self.log(f"Проверено видимых строк: {len(seen)}; подтверждено групп: {len(groups)}; безопасно пропущено: {rejected}")
+        self.log(f"Геометрический поиск: {discovery['count']}; проверено строк: {len(seen)}; добавлено чатов: {len(groups)}; исключено: {rejected}")
         return groups
+
+    def _scroll_chat_list(self) -> bool:
+        return bool(self.page.evaluate(r"""
+() => {
+  const row = document.querySelector('[data-max-finder-row]');
+  if (!row) return false;
+  let scroller = row.parentElement;
+  while (scroller) {
+    const style = getComputedStyle(scroller);
+    if (/(auto|scroll)/.test(style.overflowY) && scroller.scrollHeight > scroller.clientHeight + 10) break;
+    scroller = scroller.parentElement;
+  }
+  if (!scroller) return false;
+  const before = scroller.scrollTop;
+  scroller.scrollTop = Math.min(scroller.scrollTop + scroller.clientHeight * 0.8, scroller.scrollHeight);
+  return scroller.scrollTop > before + 1;
+}
+"""))
 
     def scan(self, stop: threading.Event, click_delay: DelayRange, chat_delay: DelayRange,
              progress: Callable[[int, int], None], found: Callable[[int], None]) -> list[Invitation]:
         if not self.page: raise RuntimeError("Сначала нажмите «Открыть MAX и войти»")
         self.page.wait_for_load_state("domcontentloaded")
-        groups = self._confirmed_group_rows()
-        if not groups:
-            self._capture_discovery_diagnostics()
-            self.log("Группы не распознаны. Диагностика DOM сохранена; личные чаты не открывались.")
-        invitations, seen = [], set(); total = len(groups)
-        for index, (row, name, reason) in enumerate(groups, 1):
-            if stop.is_set(): break
-            try:
-                self.log(f"Открываю группу {index}/{total}: {name}")
-                row.scroll_into_view_if_needed(); row.click(); click_delay.wait(stop)
-                header = self.page.locator(
-                    '[data-testid="chat-header-title"], [data-testid*="chat-header"] [data-testid*="avatar"], '
-                    'main header h1, main header h2, main header img'
-                ).first
-                header.click(); click_delay.wait(stop)
-                links = self.page.get_by_text("Ссылки", exact=True).or_(self.page.get_by_text("Links", exact=True)).first
-                links.click(); click_delay.wait(stop)
-                panel = self.page.locator('[role="tabpanel"]:visible, [data-testid*="links"]:visible, [role="dialog"]:visible').last
-                previous = -1
-                for _ in range(60):
-                    for href in panel.locator('a[href]').evaluate_all("els => els.map(e => e.href)"):
-                        invite = normalize_invite(href)
-                        if invite and invite.casefold() not in seen:
-                            seen.add(invite.casefold()); invitations.append(Invitation.create(name, invite)); found(len(invitations))
-                    height = panel.evaluate("el => el.scrollHeight")
-                    panel.evaluate("el => el.scrollTop = el.scrollHeight")
-                    if height == previous: break
-                    previous = height; click_delay.wait(stop)
-                self.page.keyboard.press("Escape")
-            except Exception as error:
-                self._capture_error(index, error)
-            progress(index, total); chat_delay.wait(stop)
+        invitations, seen, processed = [], set(), set()
+        completed = 0
+        for _ in range(200):
+            chats = self._scannable_chat_rows(processed)
+            if not chats and not processed:
+                self._capture_discovery_diagnostics(); self.log("Строки чатов не распознаны. Диагностика DOM сохранена.")
+                break
+            for batch_index, (row, name, reason, key) in enumerate(chats, 1):
+                if stop.is_set(): break
+                processed.add(key)
+                try:
+                    self.log(f"Открываю чат {completed + 1}: {name}")
+                    row.scroll_into_view_if_needed(); row.click(); click_delay.wait(stop)
+                    header = self.page.locator(
+                        '[data-testid="chat-header-title"], [data-testid*="chat-header"] [data-testid*="avatar"], '
+                        'main header h1, main header h2, main header img'
+                    ).first
+                    header.click(); click_delay.wait(stop)
+                    links = self.page.get_by_text("Ссылки", exact=True).or_(self.page.get_by_text("Links", exact=True)).first
+                    links.click(); click_delay.wait(stop)
+                    panel = self.page.locator('[role="tabpanel"]:visible, [data-testid*="links"]:visible, [role="dialog"]:visible').last
+                    previous = -1
+                    for _ in range(60):
+                        for href in panel.locator('a[href]').evaluate_all("els => els.map(e => e.href)"):
+                            invite = normalize_invite(href)
+                            if invite and invite.casefold() not in seen:
+                                seen.add(invite.casefold()); invitations.append(Invitation.create(name, invite)); found(len(invitations))
+                        height = panel.evaluate("el => el.scrollHeight"); panel.evaluate("el => el.scrollTop = el.scrollHeight")
+                        if height == previous: break
+                        previous = height; click_delay.wait(stop)
+                    self.page.keyboard.press("Escape"); self.page.keyboard.press("Escape")
+                except Exception as error:
+                    self._capture_error(completed + 1, error)
+                completed += 1; progress(completed, completed + len(chats) - batch_index); chat_delay.wait(stop)
+            if stop.is_set() or not self._scroll_chat_list(): break
+            click_delay.wait(stop)
         return invitations
 
     def _capture_discovery_diagnostics(self) -> None:

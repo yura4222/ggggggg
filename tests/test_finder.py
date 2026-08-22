@@ -44,22 +44,19 @@ class SafetyTests(unittest.TestCase):
     def test_accepts_group_from_react_model(self):
         accepted, reason = classify_dialog({"memoizedProps.chat.type": ["CHAT"]})
         self.assertTrue(accepted)
-        self.assertIn("chat", reason)
+        self.assertIn("обычная", reason)
 
-    def test_rejects_direct_channel_system_and_unknown_rows(self):
-        unsafe = (
-            {"props.peerType": ["DIRECT"]},
-            {"props.isChannel": ["true"], "props.type": ["CHAT"]},
-            {"props.entityType": ["SYSTEM"]},
-            {"dom.data-testid": ["chat-item"]},
-        )
-        for evidence in unsafe:
-            with self.subTest(evidence=evidence):
-                self.assertFalse(classify_dialog(evidence)[0])
+    def test_accepts_direct_and_unknown_chat_rows(self):
+        self.assertTrue(classify_dialog({"props.peerType": ["DIRECT"]}, "Кира")[0])
+        self.assertTrue(classify_dialog({"dom.data-testid": ["chat-item"]}, "Барахолка")[0])
 
-    def test_negative_marker_wins_over_group_marker(self):
+    def test_channel_marker_wins_over_group_marker(self):
         accepted, _ = classify_dialog({"props.type": ["CHAT"], "props.isChannel": ["true"]})
         self.assertFalse(accepted)
+
+    def test_official_max_title_is_rejected(self):
+        self.assertFalse(classify_dialog({}, "MAX ✓")[0])
+        self.assertFalse(classify_dialog({}, "Новости MAX")[0])
 
     def test_delay_range_can_be_interrupted(self):
         import threading

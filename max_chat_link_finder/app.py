@@ -24,7 +24,7 @@ class FinderApp(tk.Tk):
         self.minsize(780, 620)
         self.stop_event, self.commands, self.events = threading.Event(), queue.Queue(), queue.Queue()
         self.report_dir = tk.StringVar(value=str(Path.home() / "Documents" / "MAX Reports"))
-        self.progress_text, self.found_text = tk.StringVar(value="Группы: 0 / 0"), tk.StringVar(value="Найдено приглашений: 0")
+        self.progress_text, self.found_text = tk.StringVar(value="Чаты: 0 / 0"), tk.StringVar(value="Найдено приглашений: 0")
         self.click_min, self.click_max = tk.DoubleVar(value=0.8), tk.DoubleVar(value=1.8)
         self.chat_min, self.chat_max = tk.DoubleVar(value=2.0), tk.DoubleVar(value=4.0)
         self.diagnostic = tk.BooleanVar(value=True)
@@ -106,7 +106,7 @@ class FinderApp(tk.Tk):
             except queue.Empty: break
             if event[0] == "log": self._log(event[1])
             elif event[0] == "progress":
-                _, current, total = event; self.progress.configure(maximum=max(total, 1), value=current); self.progress_text.set(f"Группы: {current} / {total}")
+                _, current, total = event; self.progress.configure(maximum=max(total, 1), value=current); self.progress_text.set(f"Чаты: {current} / {total}")
             elif event[0] == "found": self.found_text.set(f"Найдено приглашений: {event[1]}")
             elif event[0] == "done": self._log(f"Готово. Сохранено приглашений: {event[1]}"); self.start_button.configure(state="normal")
             elif event[0] == "error": self._log("Ошибка: " + event[1]); self.start_button.configure(state="normal"); messagebox.showerror("Ошибка", event[1])
