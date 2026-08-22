@@ -1,6 +1,6 @@
 """MAX Chat Link Finder."""
 
-from .finder import extract_max_links, load_source
+from .finder import extract_max_links, normalize_invite
 
-__all__ = ["extract_max_links", "load_source"]
-__version__ = "1.0.0"
+__all__ = ["extract_max_links", "normalize_invite"]
+__version__ = "2.0.0"

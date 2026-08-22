@@ -1,43 +1,56 @@
+import csv
+import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
-from max_chat_link_finder.finder import extract_max_links, load_source, read_text_file
-
-
-class ExtractLinksTests(unittest.TestCase):
-    def test_extracts_supported_links(self):
-        text = "Канал https://max.ru/news и чат max://join/abc"
-        self.assertEqual(extract_max_links(text), ["https://max.ru/news", "max://join/abc"])
-
-    def test_removes_punctuation_and_duplicates(self):
-        text = "(https://max.ru/chat), HTTPS://MAX.RU/CHAT!"
-        self.assertEqual(extract_max_links(text), ["https://max.ru/chat"])
-
-    def test_ignores_similar_domains(self):
-        self.assertEqual(extract_max_links("https://notmax.ru/a https://max.ru.example/a"), [])
+from max_chat_link_finder.automation import DelayRange, MaxAutomation
+from max_chat_link_finder.finder import extract_max_links, normalize_invite
+from max_chat_link_finder.storage import Invitation, save_reports
 
 
-class SourceTests(unittest.TestCase):
-    def test_reads_windows_1251_file(self):
+class InviteValidationTests(unittest.TestCase):
+    def test_accepts_only_join_urls(self):
+        self.assertEqual(normalize_invite("https://max.ru/join/Abc_-12?from=web"), "https://max.ru/join/Abc_-12")
+        for url in ("https://max.ru/u/name", "https://t.me/a", "https://vk.me/a", "http://max.ru/join/x", "https://max.ru/join/"):
+            self.assertIsNone(normalize_invite(url))
+
+    def test_extracts_only_invites_and_deduplicates(self):
+        text = "https://max.ru/join/one https://max.ru/u/a https://max.ru/join/one"
+        self.assertEqual(extract_max_links(text), ["https://max.ru/join/one"])
+
+
+class StorageTests(unittest.TestCase):
+    def test_writes_equivalent_json_csv_and_sqlite(self):
+        item = Invitation("Тестовая группа", "https://max.ru/join/token", "2026-01-01T00:00:00+00:00")
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "links.txt"
-            path.write_bytes("Привет https://max.ru/test".encode("cp1251"))
-            self.assertIn("Привет", read_text_file(path))
-
-    def test_plain_text_is_unchanged(self):
-        self.assertEqual(load_source("some text"), "some text")
-
-    def test_long_text_is_not_treated_as_path(self):
-        text = "x" * 10_000
-        self.assertEqual(load_source(text), text)
-
-    @patch("max_chat_link_finder.finder.fetch_page", return_value="page")
-    def test_url_is_downloaded(self, fetch_page):
-        self.assertEqual(load_source(" https://example.org/a "), "page")
-        fetch_page.assert_called_once_with("https://example.org/a")
+            paths = save_reports(directory, [item])
+            self.assertEqual(json.loads(paths["json"].read_text(encoding="utf-8"))[0]["url"], item.url)
+            with paths["csv"].open(encoding="utf-8-sig") as stream:
+                self.assertEqual(next(csv.DictReader(stream))["chat_name"], item.chat_name)
+            with sqlite3.connect(paths["sqlite"]) as db:
+                self.assertEqual(db.execute("SELECT url FROM invitations").fetchone()[0], item.url)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class FakeRows:
+    def __init__(self): self.selector = None
+    def locator(self, selector): self.selector = selector; return self
+    def count(self): return 2
+    def nth(self, index): return f"row-{index}"
+
+
+class SafetyTests(unittest.TestCase):
+    def test_discovery_uses_explicit_group_markers_only(self):
+        page = FakeRows(); automation = MaxAutomation(Path("profile"), Path("diag"), lambda _: None); automation.page = page
+        self.assertEqual(automation._confirmed_group_rows(), ["row-0", "row-1"])
+        self.assertIn('data-chat-type="group"', page.selector)
+        self.assertNotIn("direct", page.selector)
+
+    def test_delay_range_can_be_interrupted(self):
+        import threading
+        stop = threading.Event(); stop.set()
+        DelayRange(10, 10).wait(stop)
+
+
+if __name__ == "__main__": unittest.main()
