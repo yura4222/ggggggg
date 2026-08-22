@@ -28,7 +28,10 @@ class StorageTests(unittest.TestCase):
             paths = save_reports(directory, [item])
             self.assertEqual(json.loads(paths["json"].read_text(encoding="utf-8"))[0]["url"], item.url)
             with paths["csv"].open(encoding="utf-8-sig") as stream:
-                self.assertEqual(next(csv.DictReader(stream))["chat_name"], item.chat_name)
+                row = next(csv.DictReader(stream, delimiter=";"))
+                self.assertEqual(row["chat_name"], item.chat_name)
+                self.assertEqual(row["url"], item.url)
+                self.assertEqual(row["found_at"], item.found_at)
             db = sqlite3.connect(paths["sqlite"])
             try:
                 self.assertEqual(db.execute("SELECT url FROM invitations").fetchone()[0], item.url)
@@ -38,6 +41,13 @@ class StorageTests(unittest.TestCase):
             # guards against relying on implementation-specific garbage collection.
             paths["sqlite"].unlink()
             self.assertFalse(paths["sqlite"].exists())
+
+    def test_deduplicates_same_chat_and_url(self):
+        first = Invitation("Группа", "https://max.ru/join/token", "2026-01-01T00:00:00+00:00")
+        duplicate = Invitation("ГРУППА", "https://max.ru/join/TOKEN", "2026-01-02T00:00:00+00:00")
+        with tempfile.TemporaryDirectory() as directory:
+            paths = save_reports(directory, [first, duplicate])
+            self.assertEqual(len(json.loads(paths["json"].read_text(encoding="utf-8"))), 1)
 
 
 class SafetyTests(unittest.TestCase):

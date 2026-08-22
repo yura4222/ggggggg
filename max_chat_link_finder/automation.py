@@ -83,7 +83,8 @@ MODEL_EVIDENCE_SCRIPT = r"""
     evidence,
     text: (element.innerText || '').trim().slice(0, 500),
     href: element.href || element.closest('a')?.href || element.querySelector('a[href]')?.href || '',
-    id: element.getAttribute('data-chat-id') || element.getAttribute('data-dialog-id') || element.getAttribute('data-conversation-id') || ''
+    id: element.getAttribute('data-chat-id') || element.getAttribute('data-dialog-id') || element.getAttribute('data-conversation-id') || '',
+    avatar: element.querySelector('img')?.currentSrc || element.querySelector('img')?.src || ''
   };
 }
 """
@@ -96,6 +97,15 @@ class DelayRange:
 
     def wait(self, stop: threading.Event) -> None:
         stop.wait(random.uniform(self.minimum, self.maximum))
+
+
+@dataclass(frozen=True)
+class ChatSnapshot:
+    """Stable chat identity captured before any slow navigation starts."""
+
+    key: str
+    name: str
+    reason: str
 
 
 def classify_dialog(evidence: dict[str, list[str]], name: str = "") -> tuple[bool, str]:
@@ -138,7 +148,7 @@ class MaxAutomation:
         self.page.goto(MAX_URL, wait_until="domcontentloaded")
         self.log("Открыт официальный web.max.ru. Выполните вход самостоятельно.")
 
-    def _scannable_chat_rows(self, processed: set[str] | None = None):
+    def _scannable_chat_rows(self, processed: set[str] | None = None, *, verbose: bool = True):
         processed = processed or set()
         discovery = self.page.evaluate(MARK_VISIBLE_ROWS_SCRIPT)
         # Do not union this with generic role=listitem selectors: MAX uses those
@@ -149,37 +159,74 @@ class MaxAutomation:
             row = rows.nth(index)
             try:
                 details = row.evaluate(MODEL_EVIDENCE_SCRIPT)
-                key = details["id"] or details["href"] or details["text"]
+                name = details["text"].splitlines()[0] if details["text"] else "Без названия"
+                key = details["id"] or details["href"] or f"{name.casefold()}|{details['avatar']}"
                 if not key or key in seen or key in processed: continue
                 seen.add(key)
-                name = details["text"].splitlines()[0] if details["text"] else key
                 accepted, reason = classify_dialog(details["evidence"], name)
                 if accepted:
-                    groups.append((row, name, reason, key)); self.log(f"Чат добавлен: {name} ({reason})")
+                    groups.append((row, name, reason, key))
+                    if verbose: self.log(f"Чат запомнен: {name} ({reason})")
                 else:
                     rejected += 1
             except Exception as error:
                 self.log(f"Не удалось классифицировать строку {index + 1}: {error}")
-        self.log(f"Геометрический поиск: {discovery['count']}; проверено строк: {len(seen)}; добавлено чатов: {len(groups)}; исключено: {rejected}")
+        if verbose:
+            self.log(f"Геометрический поиск: {discovery['count']}; проверено строк: {len(seen)}; добавлено чатов: {len(groups)}; исключено: {rejected}")
         return groups
 
-    def _scroll_chat_list(self) -> bool:
+    def _set_chat_scroll(self, position: str) -> bool:
         return bool(self.page.evaluate(r"""
-() => {
-  const row = document.querySelector('[data-max-finder-row]');
-  if (!row) return false;
-  let scroller = row.parentElement;
-  while (scroller) {
-    const style = getComputedStyle(scroller);
-    if (/(auto|scroll)/.test(style.overflowY) && scroller.scrollHeight > scroller.clientHeight + 10) break;
-    scroller = scroller.parentElement;
+(position) => {
+  const row = document.querySelector('[data-max-finder-row]'); if (!row) return false;
+  let pane = row.parentElement;
+  while (pane) {
+    const s = getComputedStyle(pane);
+    if (/(auto|scroll)/.test(s.overflowY) && pane.scrollHeight > pane.clientHeight + 10) break;
+    pane = pane.parentElement;
   }
-  if (!scroller) return false;
-  const before = scroller.scrollTop;
-  scroller.scrollTop = Math.min(scroller.scrollTop + scroller.clientHeight * 0.8, scroller.scrollHeight);
-  return scroller.scrollTop > before + 1;
+  if (!pane) return false;
+  const before = pane.scrollTop;
+  pane.scrollTop = position === 'top' ? 0 : Math.min(pane.scrollTop + pane.clientHeight * .8, pane.scrollHeight);
+  return position === 'top' ? true : pane.scrollTop > before + 1;
 }
-"""))
+""", position))
+
+    def _snapshot_all_chats(self, stop: threading.Event) -> list[ChatSnapshot]:
+        """Rapidly inventory the virtual list before chats can reorder during analysis."""
+        self.page.evaluate(MARK_VISIBLE_ROWS_SCRIPT)
+        self._set_chat_scroll("top")
+        self.page.wait_for_timeout(100)
+        snapshots: list[ChatSnapshot] = []
+        known: set[str] = set()
+        for _ in range(500):
+            rows = self._scannable_chat_rows(known, verbose=False)
+            for _, name, reason, key in rows:
+                if key not in known:
+                    known.add(key); snapshots.append(ChatSnapshot(key, name, reason))
+            if stop.is_set() or not self._set_chat_scroll("next"):
+                break
+            self.page.wait_for_timeout(80)
+        self.page.evaluate(MARK_VISIBLE_ROWS_SCRIPT)
+        self._set_chat_scroll("top")
+        self.page.wait_for_timeout(100)
+        self.log(f"Быстрая инвентаризация завершена: запомнено чатов {len(snapshots)}")
+        return snapshots
+
+    def _find_snapshotted_row(self, chat: ChatSnapshot):
+        search = self.page.locator('input[placeholder^="Найти"], input[placeholder^="Search"]').first
+        search.fill(chat.name)
+        self.page.wait_for_timeout(350)
+        rows = self._scannable_chat_rows(verbose=False)
+        for row, name, _, key in rows:
+            if key == chat.key or name.casefold() == chat.name.casefold():
+                return row
+        raise RuntimeError(f"Чат из снимка не найден через поиск: {chat.name}")
+
+    def _clear_chat_search(self) -> None:
+        search = self.page.locator('input[placeholder^="Найти"], input[placeholder^="Search"]').first
+        search.fill("")
+        self.page.wait_for_timeout(150)
 
     def _open_chat_info(self, row, name: str, click_delay: DelayRange, stop: threading.Event) -> None:
         row.scroll_into_view_if_needed()
@@ -194,7 +241,7 @@ class MaxAutomation:
         self.page.get_by_text("Инфо", exact=True).wait_for(state="visible", timeout=10_000)
 
     def _collect_info_invites(self, name: str, click_delay: DelayRange, stop: threading.Event,
-                              invitations: list[Invitation], seen: set[str], found: Callable[[int], None]) -> None:
+                              invitations: list[Invitation], seen: set[tuple[str, str]], found: Callable[[int], None]) -> None:
         links_tab = self.page.get_by_text("Ссылки", exact=True).or_(self.page.get_by_text("Links", exact=True)).last
         links_tab.click(timeout=10_000)
         click_delay.wait(stop)
@@ -203,8 +250,9 @@ class MaxAutomation:
             hrefs = self.page.locator('a[href*="max.ru/join/"]').evaluate_all("els => els.map(e => e.href)")
             for href in hrefs:
                 invite = normalize_invite(href)
-                if invite and invite.casefold() not in seen:
-                    seen.add(invite.casefold()); invitations.append(Invitation.create(name, invite)); found(len(invitations))
+                identity = (name.casefold(), invite.casefold()) if invite else None
+                if invite and identity not in seen:
+                    seen.add(identity); invitations.append(Invitation.create(name, invite)); found(len(invitations))
             # Info does not expose a role=tabpanel. Scroll the largest visible
             # scroll container, which is the actual Info panel in the MAX client.
             moved = self.page.evaluate(r"""
@@ -244,32 +292,25 @@ class MaxAutomation:
              progress: Callable[[int, int], None], found: Callable[[int], None]) -> list[Invitation]:
         if not self.page: raise RuntimeError("Сначала нажмите «Открыть MAX и войти»")
         self.page.wait_for_load_state("domcontentloaded")
-        invitations, seen, processed = [], set(), set()
-        completed = 0
-        for _ in range(500):
-            chats = self._scannable_chat_rows(processed)
-            if not chats and not processed:
-                self._capture_discovery_diagnostics(); self.log("Строки чатов не распознаны. Диагностика DOM сохранена.")
-                break
-            if chats:
-                # Process one locator then rediscover. A click makes React replace
-                # row nodes, so retaining nth(…) locators caused the reported 30s
-                # timeouts and shifted subsequent locators to navigation items.
-                row, name, reason, key = chats[0]
-                processed.add(key)
-                try:
-                    self.log(f"Открываю чат {completed + 1}: {name}")
-                    self._open_chat_info(row, name, click_delay, stop)
-                    self._collect_info_invites(name, click_delay, stop, invitations, seen, found)
-                    self.log(f"Ссылки в чате «{name}» проверены")
-                    self._close_info()
-                except Exception as error:
-                    self._capture_error(completed + 1, error)
-                    self._close_info()
-                completed += 1; progress(completed, completed + max(0, len(chats) - 1)); chat_delay.wait(stop)
-                continue
-            if stop.is_set() or not self._scroll_chat_list(): break
-            click_delay.wait(stop)
+        invitations, seen = [], set()
+        chats = self._snapshot_all_chats(stop)
+        if not chats:
+            self._capture_discovery_diagnostics(); self.log("Строки чатов не распознаны. Диагностика DOM сохранена.")
+            return invitations
+        for index, chat in enumerate(chats, 1):
+            if stop.is_set(): break
+            try:
+                row = self._find_snapshotted_row(chat)
+                self.log(f"Открываю чат {index}/{len(chats)}: {chat.name}")
+                self._open_chat_info(row, chat.name, click_delay, stop)
+                self._collect_info_invites(chat.name, click_delay, stop, invitations, seen, found)
+                self.log(f"Ссылки в чате «{chat.name}» проверены")
+                self._close_info()
+            except Exception as error:
+                self._capture_error(index, error); self._close_info()
+            finally:
+                self._clear_chat_search()
+            progress(index, len(chats)); chat_delay.wait(stop)
         return invitations
 
     def _capture_discovery_diagnostics(self) -> None:
