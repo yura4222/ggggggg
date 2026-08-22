@@ -17,17 +17,7 @@ from .storage import Invitation
 
 MAX_URL = "https://web.max.ru/"
 
-# MAX uses virtualized lists and does not currently expose data-chat-type on its
-# visible rows. We inspect DOM attributes *and* the row's React model, but still
-# require positive group evidence before clicking anything.
-DIALOG_ROW_SELECTOR = ", ".join((
-    '[data-chat-type]', '[data-conversation-type]', '[data-dialog-type]',
-    '[data-testid*="chat-item"]', '[data-testid*="dialog-item"]',
-    'a[href*="/chat/"]', 'a[href*="/chats/"]', '[role="listitem"]',
-    '[class*="ChatItem"]', '[class*="chatItem"]',
-    '[class*="DialogItem"]', '[class*="dialogItem"]',
-))
-
+# MAX uses a virtualized list and does not expose stable chat-row selectors.
 MARK_VISIBLE_ROWS_SCRIPT = r"""
 () => {
   document.querySelectorAll('[data-max-finder-row]').forEach(e => e.removeAttribute('data-max-finder-row'));
@@ -151,9 +141,9 @@ class MaxAutomation:
     def _scannable_chat_rows(self, processed: set[str] | None = None):
         processed = processed or set()
         discovery = self.page.evaluate(MARK_VISIBLE_ROWS_SCRIPT)
-        geometric = self.page.locator('[data-max-finder-row]').filter(visible=True)
-        semantic = self.page.locator(DIALOG_ROW_SELECTOR).filter(visible=True)
-        rows = geometric.or_(semantic)
+        # Do not union this with generic role=listitem selectors: MAX uses those
+        # for the left navigation (Все, Новые, Каналы) as well as chat content.
+        rows = self.page.locator('[data-max-finder-row]').filter(visible=True)
         groups, rejected, seen = [], 0, set()
         for index in range(rows.count()):
             row = rows.nth(index)
@@ -191,44 +181,93 @@ class MaxAutomation:
 }
 """))
 
+    def _open_chat_info(self, row, name: str, click_delay: DelayRange, stop: threading.Event) -> None:
+        row.scroll_into_view_if_needed()
+        row.click(timeout=10_000)
+        click_delay.wait(stop)
+        # The title is the reliable target in the live client; structural
+        # header/test-id selectors are not present in the current MAX markup.
+        title = self.page.get_by_text(name, exact=True).last
+        title.wait_for(state="visible", timeout=10_000)
+        title.click(timeout=10_000)
+        click_delay.wait(stop)
+        self.page.get_by_text("Инфо", exact=True).wait_for(state="visible", timeout=10_000)
+
+    def _collect_info_invites(self, name: str, click_delay: DelayRange, stop: threading.Event,
+                              invitations: list[Invitation], seen: set[str], found: Callable[[int], None]) -> None:
+        links_tab = self.page.get_by_text("Ссылки", exact=True).or_(self.page.get_by_text("Links", exact=True)).last
+        links_tab.click(timeout=10_000)
+        click_delay.wait(stop)
+        previous_count = -1
+        for _ in range(80):
+            hrefs = self.page.locator('a[href*="max.ru/join/"]').evaluate_all("els => els.map(e => e.href)")
+            for href in hrefs:
+                invite = normalize_invite(href)
+                if invite and invite.casefold() not in seen:
+                    seen.add(invite.casefold()); invitations.append(Invitation.create(name, invite)); found(len(invitations))
+            # Info does not expose a role=tabpanel. Scroll the largest visible
+            # scroll container, which is the actual Info panel in the MAX client.
+            moved = self.page.evaluate(r"""
+() => {
+  const visible = [...document.querySelectorAll('body *')].filter(e => {
+    const r = e.getBoundingClientRect(), s = getComputedStyle(e);
+    return r.width > 350 && r.height > 250 && r.bottom > 0 && r.top < innerHeight
+      && /(auto|scroll)/.test(s.overflowY) && e.scrollHeight > e.clientHeight + 10;
+  }).sort((a,b) => (b.scrollHeight-b.clientHeight) - (a.scrollHeight-a.clientHeight));
+  const pane = visible[0]; if (!pane) return false;
+  const before = pane.scrollTop; pane.scrollTop = Math.min(pane.scrollTop + pane.clientHeight * .8, pane.scrollHeight);
+  return pane.scrollTop > before + 1;
+}
+""")
+            if not moved and len(hrefs) == previous_count:
+                break
+            previous_count = len(hrefs); click_delay.wait(stop)
+
+    def _close_info(self) -> None:
+        closed = self.page.evaluate(r"""
+() => {
+  const info = [...document.querySelectorAll('body *')].find(e =>
+    e.children.length === 0 && (e.textContent || '').trim() === 'Инфо');
+  if (!info) return false;
+  const ir = info.getBoundingClientRect(), cy = ir.top + ir.height / 2;
+  const candidates = [...document.querySelectorAll('button, [role="button"]')].filter(e => {
+    const r = e.getBoundingClientRect();
+    return r.width > 15 && r.height > 15 && r.right < ir.left && Math.abs(r.top + r.height / 2 - cy) < 55;
+  }).sort((a,b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+  if (!candidates[0]) return false; candidates[0].click(); return true;
+}
+""")
+        if not closed:
+            self.page.keyboard.press("Escape")
+
     def scan(self, stop: threading.Event, click_delay: DelayRange, chat_delay: DelayRange,
              progress: Callable[[int, int], None], found: Callable[[int], None]) -> list[Invitation]:
         if not self.page: raise RuntimeError("Сначала нажмите «Открыть MAX и войти»")
         self.page.wait_for_load_state("domcontentloaded")
         invitations, seen, processed = [], set(), set()
         completed = 0
-        for _ in range(200):
+        for _ in range(500):
             chats = self._scannable_chat_rows(processed)
             if not chats and not processed:
                 self._capture_discovery_diagnostics(); self.log("Строки чатов не распознаны. Диагностика DOM сохранена.")
                 break
-            for batch_index, (row, name, reason, key) in enumerate(chats, 1):
-                if stop.is_set(): break
+            if chats:
+                # Process one locator then rediscover. A click makes React replace
+                # row nodes, so retaining nth(…) locators caused the reported 30s
+                # timeouts and shifted subsequent locators to navigation items.
+                row, name, reason, key = chats[0]
                 processed.add(key)
                 try:
                     self.log(f"Открываю чат {completed + 1}: {name}")
-                    row.scroll_into_view_if_needed(); row.click(); click_delay.wait(stop)
-                    header = self.page.locator(
-                        '[data-testid="chat-header-title"], [data-testid*="chat-header"] [data-testid*="avatar"], '
-                        'main header h1, main header h2, main header img'
-                    ).first
-                    header.click(); click_delay.wait(stop)
-                    links = self.page.get_by_text("Ссылки", exact=True).or_(self.page.get_by_text("Links", exact=True)).first
-                    links.click(); click_delay.wait(stop)
-                    panel = self.page.locator('[role="tabpanel"]:visible, [data-testid*="links"]:visible, [role="dialog"]:visible').last
-                    previous = -1
-                    for _ in range(60):
-                        for href in panel.locator('a[href]').evaluate_all("els => els.map(e => e.href)"):
-                            invite = normalize_invite(href)
-                            if invite and invite.casefold() not in seen:
-                                seen.add(invite.casefold()); invitations.append(Invitation.create(name, invite)); found(len(invitations))
-                        height = panel.evaluate("el => el.scrollHeight"); panel.evaluate("el => el.scrollTop = el.scrollHeight")
-                        if height == previous: break
-                        previous = height; click_delay.wait(stop)
-                    self.page.keyboard.press("Escape"); self.page.keyboard.press("Escape")
+                    self._open_chat_info(row, name, click_delay, stop)
+                    self._collect_info_invites(name, click_delay, stop, invitations, seen, found)
+                    self.log(f"Ссылки в чате «{name}» проверены")
+                    self._close_info()
                 except Exception as error:
                     self._capture_error(completed + 1, error)
-                completed += 1; progress(completed, completed + len(chats) - batch_index); chat_delay.wait(stop)
+                    self._close_info()
+                completed += 1; progress(completed, completed + max(0, len(chats) - 1)); chat_delay.wait(stop)
+                continue
             if stop.is_set() or not self._scroll_chat_list(): break
             click_delay.wait(stop)
         return invitations
@@ -243,7 +282,7 @@ class MaxAutomation:
         (self.diagnostics / f"discovery_{stamp}.json").write_text(json.dumps(inventory, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _capture_error(self, index: int, error: Exception) -> None:
-        self.log(f"Ошибка в группе {index}: {error}")
+        self.log(f"Ошибка в чате {index}: {error}")
         if self.page: self.page.screenshot(path=str(self.diagnostics / f"error_group_{index}_{int(time.time())}.png"), full_page=True)
 
     def close(self) -> None:
