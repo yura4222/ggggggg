@@ -14,7 +14,7 @@ class FinderApp(tk.Tk):
         super().__init__(); self.title("MAX Safe Sender"); self.geometry("980x760"); self.minsize(820,650)
         self.commands, self.events = queue.Queue(), queue.Queue(); self.stop_event, self.pause_event = threading.Event(), threading.Event()
         self.snapshots=[]; self.image=tk.StringVar(); self.copies=tk.IntVar(value=1); self.dry=tk.BooleanVar(value=True)
-        self.delay_min=tk.DoubleVar(value=2); self.delay_max=tk.DoubleVar(value=5); self.status=tk.StringVar(value="Готово")
+        self.delay_min=tk.DoubleVar(value=.3); self.delay_max=tk.DoubleVar(value=.8); self.status=tk.StringVar(value="Готово")
         self._build(); threading.Thread(target=self._worker,daemon=True).start(); self.after(100,self._poll); self.protocol("WM_DELETE_WINDOW",self._close)
 
     def _build(self):
@@ -37,7 +37,7 @@ class FinderApp(tk.Tk):
         ttk.Button(image_row,text="Изображение…",command=self._image).pack(side="left",padx=(6,0))
         opts=ttk.Frame(compose); opts.pack(fill="x")
         ttk.Label(opts,text="Копий (1–3):").pack(side="left"); ttk.Spinbox(opts,from_=1,to=3,textvariable=self.copies,width=5).pack(side="left",padx=5)
-        ttk.Label(opts,text="Задержка, сек.:").pack(side="left",padx=(15,0)); ttk.Spinbox(opts,from_=1,to=60,textvariable=self.delay_min,width=6).pack(side="left"); ttk.Label(opts,text="—").pack(side="left"); ttk.Spinbox(opts,from_=1,to=60,textvariable=self.delay_max,width=6).pack(side="left")
+        ttk.Label(opts,text="Задержка, сек.:").pack(side="left",padx=(15,0)); ttk.Spinbox(opts,from_=0.1,to=60,increment=0.1,textvariable=self.delay_min,width=6).pack(side="left"); ttk.Label(opts,text="—").pack(side="left"); ttk.Spinbox(opts,from_=0.1,to=60,increment=0.1,textvariable=self.delay_max,width=6).pack(side="left")
         ttk.Checkbutton(compose,text="Тестовый режим — не отправлять",variable=self.dry).pack(anchor="w",pady=8)
         self.progress=ttk.Progressbar(root); self.progress.pack(fill="x"); ttk.Label(root,textvariable=self.status).pack(anchor="w",pady=4)
         self.log=tk.Text(root,height=10,state="disabled",font=("Consolas",9)); self.log.pack(fill="both",expand=True)
@@ -51,6 +51,8 @@ class FinderApp(tk.Tk):
     def _start(self):
         selected=[self.snapshots[i].name for i in self.chat_list.curselection()]
         if not selected: messagebox.showerror("Нет получателей","Выберите чаты в списке"); return
+        if self.delay_min.get() < .1 or self.delay_min.get() > self.delay_max.get():
+            messagebox.showerror("Неверная задержка","Минимум должен быть не меньше 0.1 и не больше максимума"); return
         summary=f"Получателей: {len(selected)}\nКопий: {self.copies.get()}\nТестовый режим: {'да' if self.dry.get() else 'НЕТ'}\n\nПродолжить?"
         if not messagebox.askyesno("Подтверждение кампании",summary):return
         self.stop_event.clear(); self.pause_event.clear()
