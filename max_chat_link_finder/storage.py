@@ -31,7 +31,14 @@ def save_reports(folder: str | Path, invitations: list[Invitation]) -> dict[str,
         writer = csv.DictWriter(stream, fieldnames=["chat_name", "url", "found_at"])
         writer.writeheader()
         writer.writerows(asdict(item) for item in invitations)
-    with sqlite3.connect(paths["sqlite"]) as database:
-        database.execute("CREATE TABLE invitations (chat_name TEXT NOT NULL, url TEXT NOT NULL, found_at TEXT NOT NULL)")
-        database.executemany("INSERT INTO invitations VALUES (?, ?, ?)", [(x.chat_name, x.url, x.found_at) for x in invitations])
+    # sqlite3.Connection.__exit__ commits or rolls back the transaction, but it
+    # does not close the connection.  An explicit close is required on Windows,
+    # where an open SQLite handle prevents report folders from being removed.
+    database = sqlite3.connect(paths["sqlite"])
+    try:
+        with database:
+            database.execute("CREATE TABLE invitations (chat_name TEXT NOT NULL, url TEXT NOT NULL, found_at TEXT NOT NULL)")
+            database.executemany("INSERT INTO invitations VALUES (?, ?, ?)", [(x.chat_name, x.url, x.found_at) for x in invitations])
+    finally:
+        database.close()
     return paths

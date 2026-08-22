@@ -29,8 +29,15 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(json.loads(paths["json"].read_text(encoding="utf-8"))[0]["url"], item.url)
             with paths["csv"].open(encoding="utf-8-sig") as stream:
                 self.assertEqual(next(csv.DictReader(stream))["chat_name"], item.chat_name)
-            with sqlite3.connect(paths["sqlite"]) as db:
+            db = sqlite3.connect(paths["sqlite"])
+            try:
                 self.assertEqual(db.execute("SELECT url FROM invitations").fetchone()[0], item.url)
+            finally:
+                db.close()
+            # Windows must be able to remove the report immediately; this also
+            # guards against relying on implementation-specific garbage collection.
+            paths["sqlite"].unlink()
+            self.assertFalse(paths["sqlite"].exists())
 
 
 class FakeRows:
