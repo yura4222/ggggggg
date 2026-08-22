@@ -192,7 +192,7 @@ class MaxAutomation:
 }
 """, position))
 
-    def _snapshot_all_chats(self, stop: threading.Event) -> list[ChatSnapshot]:
+    def snapshot_all_chats(self, stop: threading.Event) -> list[ChatSnapshot]:
         """Rapidly inventory the virtual list before chats can reorder during analysis."""
         self.page.evaluate(MARK_VISIBLE_ROWS_SCRIPT)
         self._set_chat_scroll("top")
@@ -293,7 +293,7 @@ class MaxAutomation:
         if not self.page: raise RuntimeError("Сначала нажмите «Открыть MAX и войти»")
         self.page.wait_for_load_state("domcontentloaded")
         invitations, seen = [], set()
-        chats = self._snapshot_all_chats(stop)
+        chats = self.snapshot_all_chats(stop)
         if not chats:
             self._capture_discovery_diagnostics(); self.log("Строки чатов не распознаны. Диагностика DOM сохранена.")
             return invitations
