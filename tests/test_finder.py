@@ -75,3 +75,12 @@ class SafetyTests(unittest.TestCase):
 
 
 if __name__ == "__main__": unittest.main()
+
+class CampaignSafetyTests(unittest.TestCase):
+    def test_requires_explicit_scanned_recipients_and_limit(self):
+        from max_safe_sender.campaign import Campaign, validate_campaign
+        validate_campaign(Campaign(("Группа",), "Текст"), {"группа"})
+        with self.assertRaises(ValueError):
+            validate_campaign(Campaign(tuple(f"Чат {i}" for i in range(21)), "Текст"), {f"чат {i}" for i in range(21)})
+        with self.assertRaises(ValueError):
+            validate_campaign(Campaign(("Неизвестный",), "Текст"), {"группа"})
