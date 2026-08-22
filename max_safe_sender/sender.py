@@ -22,6 +22,42 @@ class ApprovedSender:
     def __init__(self, browser: MaxAutomation, log: Callable[[str], None]) -> None:
         self.browser, self.log = browser, log
 
+    def _send_current_message(self, editor) -> None:
+        """Use MAX's send control, falling back to Enter only when absent."""
+        send = self.browser.page.locator(
+            'button[aria-label*="отправ" i]:visible, [role="button"][aria-label*="отправ" i]:visible, '
+            'button[title*="отправ" i]:visible, button[aria-label*="send" i]:visible, '
+            '[data-testid*="send" i]:visible'
+        ).last
+        if send.count():
+            send.click(timeout=5_000)
+        else:
+            # Text-only MAX builds submit the composer with Enter and have no
+            # labelled send button in the DOM.
+            editor.press("Enter")
+
+    @staticmethod
+    def _type_message(editor, message: str) -> None:
+        editor.click()
+        editor.press("Control+A")
+        editor.insert_text(message)
+
+    def _attach_image(self, image: str, delay: DelayRange, stop: threading.Event):
+        chooser = self.browser.page.locator('input[type="file"]')
+        if not chooser.count():
+            attach = self.browser.page.locator(
+                'button[aria-label*="прикреп" i], [role="button"][aria-label*="прикреп" i], '
+                'button[title*="прикреп" i], button[aria-label*="attach" i]'
+            ).last
+            attach.click(timeout=5_000); delay.wait(stop)
+            chooser = self.browser.page.locator('input[type="file"]')
+        if not chooser.count(): raise RuntimeError("Кнопка прикрепления изображения не найдена")
+        chooser.last.set_input_files(image); delay.wait(stop)
+        self.browser.page.evaluate(MARK_COMPOSER_SCRIPT)
+        editor = self.browser.page.locator('[data-max-sender-editor="true"]')
+        editor.wait_for(state="visible", timeout=10_000)
+        return editor
+
     def run(self, campaign: Campaign, scanned: list[ChatSnapshot], state_path: Path,
             stop: threading.Event, pause: threading.Event, delay: DelayRange,
             progress: Callable[[int, int], None]) -> CampaignState:
@@ -43,28 +79,24 @@ class ApprovedSender:
                 editor = self.browser.page.locator('[data-max-sender-editor="true"]')
                 editor.wait_for(state="visible", timeout=10_000)
                 if campaign.image:
-                    chooser = self.browser.page.locator('input[type="file"]')
-                    if not chooser.count():
-                        attach = self.browser.page.locator(
-                            'button[aria-label*="прикреп" i], [role="button"][aria-label*="прикреп" i], '
-                            'button[title*="прикреп" i], button[aria-label*="attach" i]'
-                        ).last
-                        attach.click(timeout=5_000); delay.wait(stop)
-                        chooser = self.browser.page.locator('input[type="file"]')
-                    if not chooser.count(): raise RuntimeError("Кнопка прикрепления изображения не найдена")
-                    chooser.last.set_input_files(campaign.image)
-                    delay.wait(stop)
-                    self.browser.page.evaluate(MARK_COMPOSER_SCRIPT)
-                    editor = self.browser.page.locator('[data-max-sender-editor="true"]')
-                    editor.wait_for(state="visible", timeout=10_000)
-                editor.click()
-                editor.press("Control+A")
-                editor.insert_text(campaign.message)
+                    editor = self._attach_image(campaign.image, delay, stop)
+                self._type_message(editor, campaign.message)
                 if campaign.dry_run:
                     self.log(f"Тест: подготовлено сообщение для {name}, отправки нет")
                 else:
-                    for _ in range(campaign.copies):
-                        editor.press("Enter"); delay.wait(stop)
+                    for copy_index in range(campaign.copies):
+                        self._send_current_message(editor)
+                        delay.wait(stop)
+                        self.log(f"Отправлено в «{name}»: {copy_index + 1}/{campaign.copies}")
+                        if copy_index + 1 < campaign.copies:
+                            # Sending clears/re-renders the editor. Reacquire it
+                            # and type the content again for each requested copy.
+                            self.browser.page.evaluate(MARK_COMPOSER_SCRIPT)
+                            editor = self.browser.page.locator('[data-max-sender-editor="true"]')
+                            editor.wait_for(state="visible", timeout=10_000)
+                            if campaign.image:
+                                editor = self._attach_image(campaign.image, delay, stop)
+                            self._type_message(editor, campaign.message)
                 state.completed.append(name); state.failed.pop(name, None)
             except Exception as error:
                 state.failed[name] = str(error); self.log(f"Пропущен {name}: {error}")
