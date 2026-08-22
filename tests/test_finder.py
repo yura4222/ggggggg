@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from max_chat_link_finder.automation import DelayRange, MaxAutomation
+from max_chat_link_finder.automation import DelayRange, classify_dialog
 from max_chat_link_finder.finder import extract_max_links, normalize_invite
 from max_chat_link_finder.storage import Invitation, save_reports
 
@@ -40,19 +40,26 @@ class StorageTests(unittest.TestCase):
             self.assertFalse(paths["sqlite"].exists())
 
 
-class FakeRows:
-    def __init__(self): self.selector = None
-    def locator(self, selector): self.selector = selector; return self
-    def count(self): return 2
-    def nth(self, index): return f"row-{index}"
-
-
 class SafetyTests(unittest.TestCase):
-    def test_discovery_uses_explicit_group_markers_only(self):
-        page = FakeRows(); automation = MaxAutomation(Path("profile"), Path("diag"), lambda _: None); automation.page = page
-        self.assertEqual(automation._confirmed_group_rows(), ["row-0", "row-1"])
-        self.assertIn('data-chat-type="group"', page.selector)
-        self.assertNotIn("direct", page.selector)
+    def test_accepts_group_from_react_model(self):
+        accepted, reason = classify_dialog({"memoizedProps.chat.type": ["CHAT"]})
+        self.assertTrue(accepted)
+        self.assertIn("chat", reason)
+
+    def test_rejects_direct_channel_system_and_unknown_rows(self):
+        unsafe = (
+            {"props.peerType": ["DIRECT"]},
+            {"props.isChannel": ["true"], "props.type": ["CHAT"]},
+            {"props.entityType": ["SYSTEM"]},
+            {"dom.data-testid": ["chat-item"]},
+        )
+        for evidence in unsafe:
+            with self.subTest(evidence=evidence):
+                self.assertFalse(classify_dialog(evidence)[0])
+
+    def test_negative_marker_wins_over_group_marker(self):
+        accepted, _ = classify_dialog({"props.type": ["CHAT"], "props.isChannel": ["true"]})
+        self.assertFalse(accepted)
 
     def test_delay_range_can_be_interrupted(self):
         import threading
